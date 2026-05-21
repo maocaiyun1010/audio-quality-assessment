@@ -93,6 +93,17 @@ if errorlevel 1 (
   )
 )
 
+if exist requirements-pdf.txt (
+  "%PYTHON%" -c "import markdown; from web_ui_report_pdf import pdf_export_available; raise SystemExit(0 if pdf_export_available() else 1)" >nul 2>&1
+  if errorlevel 1 (
+    echo 检测到 PDF 导出依赖缺失：正在安装 requirements-pdf.txt ...
+    "%PYTHON%" -m pip install -r requirements-pdf.txt
+    if errorlevel 1 (
+      echo 警告：PDF 依赖安装失败；Web UI 仍可启动，但「下载 PDF」不可用。
+    )
+  )
+)
+
 if exist requirements-nisqa.txt (
   "%PYTHON%" -c "import nisqa" >nul 2>&1
   if errorlevel 1 (

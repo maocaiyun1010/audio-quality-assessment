@@ -74,6 +74,55 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+def _dify_http_error_summary(status: int, body: str) -> str:
+    """将 Dify HTTP 错误整理为可读说明（含常见的 Internal Server Error 文案）。"""
+    snippet = (body or "").strip().replace("\n", " ")[:1200]
+    low = snippet.lower()
+    if status >= 500 or "internal server error" in low:
+        hint = (
+            f"Dify 服务端内部错误（HTTP {status}），非本机 Web UI 程序崩溃。"
+            "请检查：Dify 应用/workflow 是否已发布、API Key 是否有效、所选模型/额度是否正常、"
+            "工作流节点日志；必要时联系 Dify 平台管理员。"
+        )
+        if snippet:
+            return f"{hint} 平台返回：{snippet}"
+        return hint
+    return f"HTTP {status}: {snippet or '(empty body)'}"
+
+
+def _dify_stream_is_plugin_daemon_idle(msg: str) -> bool:
+    low = (msg or "").lower()
+    return "plugin daemon stream idle" in low or (
+        "plugin-daemon" in low and "stream idle" in low
+    )
+
+
+def _dify_stream_error_summary(msg: str) -> str:
+    """将 Dify SSE ``event=error`` 文案整理为可读说明。"""
+    raw = (msg or "").strip()
+    if not raw:
+        return ""
+    if _dify_stream_is_plugin_daemon_idle(raw):
+        return (
+            f"{raw}\n"
+            "【说明】Dify 插件守护进程在已收到大量流式分片后，约 90 秒内未再收到插件/模型输出，"
+            "判定插件侧可能卡住或未正常结束（非本机 Web UI 断开）。\n"
+            "【建议】1) 在 Dify 控制台查看该次运行的插件/LLM 节点日志；"
+            "2) 联系平台管理员检查 plugin-daemon 与报错 URL 中的插件实例；"
+            "3) 缩短上传音频：环境变量 DIFY_UPLOAD_MAX_AUDIO_SECONDS=30；"
+            "4) 本机可设 DIFY_PREFER_BLOCKING=1 优先用 blocking 拉取完整回复；"
+            "5) 若工作流含多轮插件/工具调用，可简化节点或更换模型。"
+        )
+    low = raw.lower()
+    if "gateway timeout" in low or "504" in raw:
+        return (
+            f"{raw}\n"
+            "【说明】网关或上游服务超时，常见于长音频 + 复杂工作流。\n"
+            "【建议】缩短音频、简化工作流，或联系 Dify 平台管理员调大超时。"
+        )
+    return raw
+
+
 # Dify 侧常见限制：``audio_eval_prompt`` 须 **小于 256 个字符**（本仓库默认按最多 255 个码点截断）。
 # 完整评分指令、JSON Schema 仍在 HTTP 请求体的 ``query`` 正文中，不在此字段重复长文。
 _DIFY_AUDIO_EVAL_PROMPT_MAX_LEN = 255
@@ -277,6 +326,7 @@ def _live_scoring_detail(detail: str) -> None:
 # DIFY_EMPTY_BODY_STREAM_ATTEMPTS：流式无正文时的重复次数（默认 2，可设为 1 以更快失败）。
 # DIFY_BLOCKING_MAX_ATTEMPTS：blocking 兜底最多尝试次数（默认 2）。
 # DIFY_SKIP_BLOCKING_FALLBACK=1：流式无正文时不走 blocking（更快失败，排查用）。
+# DIFY_PREFER_BLOCKING=1：评分对话优先 blocking，绕过易触发 plugin-daemon 流空闲的 SSE。
 _DEFAULT_PER_UPLOAD_GAP = 0.65
 _DEFAULT_STIMULUS_POST_UPLOAD = 5.0
 _DEFAULT_SINGLE_POST_UPLOAD = 1.0
@@ -663,7 +713,9 @@ class DifyClient:
                     self._emit(f"[Dify] {log_label}：上传成功")
                     _live_scoring_detail(f"{log_label}：附件已上传")
                     return result
-                last_err = f"HTTP {response.status_code}: {response.text[:1200]}"
+                last_err = _dify_http_error_summary(
+                    response.status_code, response.text
+                )
                 # #region agent log
                 _agent_dbg_upload(
                     "H2",
@@ -732,7 +784,9 @@ class DifyClient:
                     self._emit(f"[Dify] {log_label}：已连接，正在接收模型输出…")
                     _live_scoring_detail(f"{log_label}：正在接收模型流式回复…")
                     return response
-                last_err = f"HTTP {response.status_code}: {response.text[:1200]}"
+                last_err = _dify_http_error_summary(
+                    response.status_code, response.text
+                )
             except requests.RequestException as exc:
                 last_err = f"{type(exc).__name__}: {exc}"
         self._emit(f"[Dify] {log_label}：请求失败（已重试3次）— {last_err}")
@@ -1180,8 +1234,8 @@ class DifyClient:
 
     def collect_stream_answer(
         self, response: requests.Response, *, log_label: str = ""
-    ) -> str:
-        """从 Dify 流式响应中取出完整回答（兼容 answer / data 嵌套及末段 JSON 兜底）。"""
+    ) -> tuple[str, Optional[str]]:
+        """从 Dify 流式响应中取出完整回答；返回 ``(正文, 流式错误事件文案或 None)``。"""
         lines: list[str] = []
         wall = _stream_collect_wall_sec()
         deadline = time.monotonic() + wall
@@ -1231,7 +1285,8 @@ class DifyClient:
             ch = self._parse_sse_line(ln)
             if ch and ch.get("event") == "error":
                 stream_err = str(ch.get("message") or ch.get("code") or ch)[:500]
-                self._emit(f"[Dify] 流式错误事件：{stream_err}")
+                summary = _dify_stream_error_summary(stream_err)
+                self._emit(f"[Dify] 流式错误事件：{summary[:800]}")
                 _live_scoring_detail(
                     f"{_lbl}：Dify 返回错误 — {stream_err[:120]}"
                 )
@@ -1242,6 +1297,11 @@ class DifyClient:
             self._fallback_extract_scoring_text_from_sse_lines(lines) if not agg else ""
         )
         text = agg or fb
+        if stream_err and (text or "").strip():
+            self._emit(
+                f"[Dify] {_lbl}：流结束时出现异常，但已合并部分正文（{len(text)} 字符）；"
+                "将尝试解析，若 JSON 不完整可能仍需重试。"
+            )
         if not (text or "").strip():
             for ln in lines:
                 ch = self._parse_sse_line(ln)
@@ -1268,7 +1328,10 @@ class DifyClient:
             self._emit(
                 f"[Dify] {_lbl}：共收到 {len(lines)} 行 SSE，但未解析出模型正文；"
                 f"末段事件：{tail}。"
-                + (" 流式错误：" + stream_err[:200] if stream_err else "")
+                + (
+                    " 流式错误："
+                    + (_dify_stream_error_summary(stream_err)[:400] if stream_err else "")
+                )
             )
         # #region agent log
         _agent_dbg_upload(
@@ -1285,7 +1348,7 @@ class DifyClient:
             },
         )
         # #endregion
-        return text or ""
+        return (text or "").strip(), stream_err
 
     def _post_and_collect_stream_answer(
         self, data: dict, log_label: str, timeout: int | float
@@ -1294,26 +1357,45 @@ class DifyClient:
         发起流式对话并解析正文；若正文为空则**再流式重试 1 次**；仍空则 **blocking** 同步拉取
         （适配工作流仅把结果放在 ``node_finished.outputs``、或网关缓冲导致 SSE 无 ``answer`` 等情形）。
         """
+        http_timeout = _chat_request_timeout(float(timeout))
+        if _env_truthy("DIFY_PREFER_BLOCKING") and not _env_truthy(
+            "DIFY_SKIP_BLOCKING_FALLBACK"
+        ):
+            self._emit(
+                f"[Dify] {log_label}：已设置 DIFY_PREFER_BLOCKING=1，优先 blocking 拉取…"
+            )
+            btxt = self._post_chat_messages_blocking_collect(
+                data, log_label, http_timeout
+            )
+            if btxt and btxt.strip():
+                return btxt.strip()
+
         stream_attempts = _empty_body_stream_attempts()
         empty_hint = (
             "未从流式事件中解析到模型正文（部分模型/工作流可能不写 answer、或仅末包有 outputs）；"
             f"1 秒后将自动重试流式（最多 {stream_attempts} 次）；"
             "若仍失败将再尝试 blocking 模式（可用 DIFY_SKIP_BLOCKING_FALLBACK=1 跳过）。"
         )
-        http_timeout = _chat_request_timeout(float(timeout))
+        plugin_idle = False
         for attempt in range(stream_attempts):
             if attempt > 0:
                 self._emit(f"[Dify] {log_label}：{empty_hint}")
                 time.sleep(1.0)
             label = log_label if attempt == 0 else f"{log_label}·正文补采"
             resp = self._post_chat_messages_stream_with_retry(data, label, http_timeout)
+            stream_err_last: Optional[str] = None
             try:
-                text = self.collect_stream_answer(resp, log_label=log_label)
+                text, stream_err_last = self.collect_stream_answer(
+                    resp, log_label=log_label
+                )
             finally:
                 try:
                     resp.close()
                 except Exception:
                     pass
+            plugin_idle = bool(
+                stream_err_last and _dify_stream_is_plugin_daemon_idle(stream_err_last)
+            )
             # #region agent log
             _agent_dbg_upload(
                 "H2",
@@ -1324,6 +1406,7 @@ class DifyClient:
                     "attempt": attempt,
                     "text_len": len(text or ""),
                     "text_nonempty": bool((text or "").strip()),
+                    "plugin_idle": plugin_idle,
                 },
             )
             # #endregion
@@ -1331,6 +1414,12 @@ class DifyClient:
                 if attempt > 0:
                     self._emit(f"[Dify] {log_label}：正文补采成功，已得到模型输出。")
                 return text
+            if plugin_idle:
+                self._emit(
+                    f"[Dify] {log_label}：检测到 plugin-daemon 流空闲超时，"
+                    "跳过其余流式重试，改试 blocking…"
+                )
+                break
 
         if _env_truthy("DIFY_SKIP_BLOCKING_FALLBACK"):
             self._emit(
@@ -1346,9 +1435,15 @@ class DifyClient:
         if btxt and btxt.strip():
             return btxt.strip()
 
+        tail = (
+            "（此前为 plugin-daemon 流空闲超时，请优先查 Dify 插件/LLM 节点与平台 plugin-daemon 日志。）"
+            if plugin_idle
+            else ""
+        )
         self._emit(
             f"[Dify] {log_label}：流式 {stream_attempts} 次 + blocking 兜底后仍无可用正文；"
             "请检查 Dify 工作流末节点是否将回复写入对话 answer、或是否仅在工作流变量中输出。"
+            + tail
         )
         _live_scoring_detail(f"{log_label}：Dify 未返回可用正文，请检查工作流或模型")
         return ""

@@ -209,7 +209,12 @@ def render_nisqa_only_report(
             "逐条客观评分，未调用 Dify。"
         )
 
-    render_nisqa_only_results(payload, key_prefix="nisqa_report_main", show_banner=False)
+    render_nisqa_only_results(
+        payload,
+        key_prefix="nisqa_report_main",
+        show_banner=False,
+        eval_mode=str(pay.get("eval_mode") or ""),
+    )
 
 
 def _nisqa_note_badge(note: str) -> str:
@@ -513,6 +518,7 @@ def render_nisqa_only_results(
     *,
     key_prefix: str = "nisqa_page",
     show_banner: bool = True,
+    eval_mode: str = "",
 ) -> None:
     """展示仅 NISQA 批次结果（专页与评测主页运行区共用）。"""
     from nisqa_local import render_nisqa_appendix_markdown, tracks_to_csv_rows
@@ -556,6 +562,59 @@ def render_nisqa_only_results(
         _render_nisqa_detail_body(report, key_prefix=key_prefix)
 
     with tab_export:
+        st.caption(
+            "PDF 内容与「总览」「录音明细」标签页一致（含维度卡片、雷达、A/B 差异表与逐条明细）。"
+        )
+        try:
+            from web_ui_report_pdf import (
+                PDF_RENDERER_VERSION,
+                build_nisqa_only_report_pdf,
+                pdf_export_available,
+                pdf_render_backend_label,
+                suggested_nisqa_pdf_filename,
+            )
+
+            if not pdf_export_available():
+                st.info("安装 PDF 依赖后可导出：`pip install -r requirements-pdf.txt`")
+            else:
+                st.caption(f"PDF 渲染：{pdf_render_backend_label()}")
+                _payload_key = json.dumps(
+                    payload, ensure_ascii=False, sort_keys=True, default=str
+                )
+
+                @st.cache_data(show_spinner="正在生成 NISQA PDF…")
+                def _cached_nisqa_pdf(
+                    _payload_json: str,
+                    _eval_mode: str,
+                    _pdf_ver: str,
+                ) -> bytes:
+                    _p = json.loads(_payload_json)
+                    pdf_b, pdf_msg = build_nisqa_only_report_pdf(
+                        _p, eval_mode=_eval_mode
+                    )
+                    if pdf_b is None:
+                        raise RuntimeError(pdf_msg)
+                    return pdf_b
+
+                try:
+                    _nisqa_pdf = _cached_nisqa_pdf(
+                        _payload_key,
+                        eval_mode or "",
+                        PDF_RENDERER_VERSION,
+                    )
+                    st.download_button(
+                        "下载 PDF（与 NISQA 专页一致）",
+                        data=_nisqa_pdf,
+                        file_name=suggested_nisqa_pdf_filename(),
+                        mime="application/pdf",
+                        type="primary",
+                        key=f"{key_prefix}_dl_pdf",
+                    )
+                except Exception as _pdf_exc:
+                    st.error(f"PDF 生成失败：{_pdf_exc}")
+        except ImportError as _pdf_imp:
+            st.caption(f"PDF 模块未加载：{_pdf_imp}")
+
         c1, c2, c3 = st.columns(3)
         with c1:
             st.download_button(
@@ -597,7 +656,7 @@ def render_nisqa_only_page() -> None:
     )
     st.markdown(
         '<p class="sub-muted">仅运行本地 NISQA 模型，<strong>不调用 Dify</strong>、不产生主观五维分。'
-        "结果可导出 JSON / CSV / Markdown 表。</p>",
+        "结果可导出 JSON / CSV / Markdown / PDF（与专页展示一致）。</p>",
         unsafe_allow_html=True,
     )
 

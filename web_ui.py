@@ -27,6 +27,7 @@ from eval_source_summary import (
     load_analysis_from_score_json_path,
     rows_to_dataframe,
 )
+from web_ui_report_html import html_dim_scores_highlight
 from gen_report import generate_report
 from markdown_report import (
     _core_conclusion_highlight_html,
@@ -946,7 +947,7 @@ def _render_run_logs_box() -> None:
         panel = st.container(border=True)
     with panel:
         if not logs:
-            st.caption("暂无运行日志。")
+            st.caption("暂无运行事件。")
             return
         if not expand:
             lines: list[str] = []
@@ -956,7 +957,7 @@ def _render_run_logs_box() -> None:
                 icon = {"error": "❌", "warning": "⚠️", "success": "✅"}.get(lv, "ℹ️")
                 lines.append(f"[{ts}] {icon} {rec.get('title', '')}")
             st.text_area(
-                "运行日志（固定高度）",
+                "运行事件（紧凑列表）",
                 value="\n".join(lines),
                 height=250,
                 disabled=True,
@@ -1037,7 +1038,7 @@ def _finalize_eval_subprocess() -> None:
                     _miss = _extras_expected - len(extra_reports)
                     _w = (
                         f"多模型追加：预期成功 {_extras_expected} 个，实际完成 {len(extra_reports)} 个，"
-                        f"有 {_miss} 个未生成报告（详见运行日志）。"
+                        f"有 {_miss} 个未生成报告（详见运行事件日志）。"
                     )
                     st.session_state["_eval_multi_model_warn"] = _w
                     _append_run_log("warning", "多模型追加·部分失败", _w)
@@ -1131,7 +1132,7 @@ def _finalize_eval_subprocess() -> None:
             elif len(emods) > 1:
                 st.session_state["_eval_multi_model_warn"] = (
                     f"检测到录音文件（会话 {safe!r}），但所选 {len(emods)} 个模型补评均未成功；"
-                    "请查看运行日志中的 Dify 与评分错误。"
+                    "请查看运行事件日志中的 Dify 与评分错误。"
                 )
                 _append_run_log("warning", "多模型·录音补评无产出", st.session_state["_eval_multi_model_warn"])
     st.rerun()
@@ -1146,98 +1147,6 @@ def _strip_ch6_core_block_for_web(section_six_md: str) -> str:
         return section_six_md
     _, tail = rest.split("### 综合评价", 1)
     return lead.rstrip() + "\n\n### 综合评价" + tail
-
-
-_DIM_SCORE_SHORT: dict[str, str] = {
-    "声音响度": "响度",
-    "人声清晰度": "人声",
-    "听感舒适度": "舒适度",
-    "失真与噪声": "失真/噪声",
-    "频响平衡": "平衡",
-}
-
-
-def _diff_accent_color(delta: float) -> str:
-    """刺激比较分差着色：优/劣/持平。"""
-    if delta > 0.05:
-        return "#059669"
-    if delta < -0.05:
-        return "#dc2626"
-    return "#1d4ed8"
-
-
-def _html_dim_scores_highlight(
-    *,
-    eval_metrics: list[str],
-    dut_avg: np.ndarray,
-    score_dut: float,
-    pairwise: bool,
-    diff_avg: np.ndarray,
-    score_ref: float,
-    diff: float,
-) -> str:
-    """一体化概览顶部：单机突出映射分；刺激比较模式突出各维/总体平均分差（−3～+3 标尺），映射分为辅。"""
-    parts: list[str] = []
-    for i, m in enumerate(eval_metrics):
-        lab = html.escape(_DIM_SCORE_SHORT.get(m, m))
-        val = float(dut_avg[i])
-        delta = float(diff_avg[i])
-        if pairwise:
-            dc = _diff_accent_color(delta)
-            parts.append(
-                f'<div style="background:#f8fafc;border:2px solid #cbd5e1;border-radius:12px;'
-                f'padding:14px 10px;text-align:center;min-height:118px;display:flex;flex-direction:column;'
-                f'justify-content:center;align-items:center;">'
-                f'<div style="font-size:0.88rem;color:#475569;font-weight:700;margin-bottom:4px;">{lab}</div>'
-                f'<div style="font-size:0.72rem;color:#64748b;font-weight:600;margin-bottom:2px;">'
-                f"平均分差（−3～+3）</div>"
-                f'<div style="font-size:2.1rem;font-weight:900;color:{dc};line-height:1.1;'
-                f'letter-spacing:-0.02em;">{delta:+.2f}</div>'
-                f'<div style="margin-top:6px;font-size:0.84rem;font-weight:600;color:#64748b;">'
-                f"映射分 {val:.2f}</div>"
-                f"</div>"
-            )
-        else:
-            parts.append(
-                f'<div style="background:#eff6ff;border:2px solid #2563eb;border-radius:12px;'
-                f'padding:14px 10px;text-align:center;min-height:108px;display:flex;flex-direction:column;'
-                f'justify-content:center;align-items:center;">'
-                f'<div style="font-size:0.92rem;color:#334155;font-weight:700;margin-bottom:6px;">{lab}</div>'
-                f'<div style="font-size:2.05rem;font-weight:900;color:#1d4ed8;line-height:1.1;'
-                f'letter-spacing:-0.02em;">{val:.2f}</div>'
-                f"</div>"
-            )
-    if pairwise:
-        dc_t = _diff_accent_color(diff)
-        total = (
-            f'<div style="background:linear-gradient(160deg,#0f172a 0%,#1e3a8a 52%,#1d4ed8 100%);'
-            f'border-radius:12px;padding:14px 10px;text-align:center;min-height:118px;'
-            f'display:flex;flex-direction:column;justify-content:center;align-items:center;'
-            f'box-shadow:0 4px 18px rgba(15,23,42,0.45);">'
-            f'<div style="font-size:0.88rem;color:rgba(255,255,255,0.9);font-weight:700;margin-bottom:4px;">'
-            f"五维总平均分差</div>"
-            f'<div style="font-size:0.72rem;color:rgba(255,255,255,0.75);font-weight:600;margin-bottom:2px;">'
-            f"标尺 −3～+3（JSON 聚合）</div>"
-            f'<div style="font-size:2.2rem;font-weight:900;color:{dc_t};line-height:1.1;">{diff:+.2f}</div>'
-            f'<div style="margin-top:8px;font-size:0.82rem;font-weight:600;color:rgba(255,255,255,0.88);">'
-            f"映射均分 {score_dut:.2f} · 基准 {score_ref:.2f}</div>"
-            f"</div>"
-        )
-    else:
-        total = (
-            f'<div style="background:linear-gradient(160deg,#1e3a8a 0%,#2563eb 48%,#3b82f6 100%);'
-            f'border-radius:12px;padding:14px 10px;text-align:center;min-height:108px;'
-            f'display:flex;flex-direction:column;justify-content:center;align-items:center;'
-            f'box-shadow:0 4px 14px rgba(37,99,235,0.35);">'
-            f'<div style="font-size:0.92rem;color:rgba(255,255,255,0.92);font-weight:700;margin-bottom:6px;">'
-            f"五维总平均</div>"
-            f'<div style="font-size:2.15rem;font-weight:900;color:#fff;line-height:1.1;">{score_dut:.2f}</div>'
-            f'<div style="margin-top:6px;font-size:0.82rem;font-weight:600;color:rgba(255,255,255,0.88);">'
-            f"（测试机五维算术平均）</div>"
-            f"</div>"
-        )
-    parts.append(total)
-    return '<div class="dim-score-hero-grid">' + "".join(parts) + "</div>"
 
 
 def _render_eval_results(
@@ -1534,7 +1443,7 @@ def _render_eval_results(
                 "下方「测试报告详情」为逐音源与正文，不重复渲染图表。"
             )
         st.markdown(
-            _html_dim_scores_highlight(
+            html_dim_scores_highlight(
                 eval_metrics=list(EVAL_METRICS),
                 dut_avg=dut_avg,
                 score_dut=score_dut,
@@ -1684,6 +1593,66 @@ def _render_eval_results(
                 st.caption(f"NISQA 可视化加载失败：{_nisqa_ui_exc}")
 
     st.subheader("导出报告")
+    st.caption(
+        "「PDF（与评测结果页一致）」含一体化概览、柱状/雷达图、评分汇总表、"
+        "逐音源明细、第六章终稿及 NISQA 可视化（卡片/雷达/差异表，与评测页一致）。"
+    )
+    try:
+        from web_ui_report_pdf import (
+            PDF_RENDERER_VERSION,
+            build_eval_report_pdf,
+            pdf_export_available,
+            pdf_render_backend_label,
+            suggested_pdf_filename,
+        )
+
+        if not pdf_export_available():
+            st.info("安装 PDF 依赖后可导出：`pip install -r requirements-pdf.txt`")
+        else:
+            st.caption(f"PDF 渲染：{pdf_render_backend_label()}")
+
+            @st.cache_data(show_spinner="正在生成 PDF（与评测结果页一致）…")
+            def _cached_eval_pdf(
+                _score_json: str,
+                _dut: str,
+                _ref: str,
+                _mic: str,
+                _model: str,
+                _pdf_ver: str,
+            ) -> bytes:
+                pdf_b, pdf_msg = build_eval_report_pdf(
+                    score_json_path=_score_json,
+                    dut_s=_dut,
+                    ref_s=_ref,
+                    mic_pick=_mic,
+                    model_line=_model,
+                )
+                if pdf_b is None:
+                    raise RuntimeError(pdf_msg)
+                return pdf_b
+
+            try:
+                _pdf_bytes = _cached_eval_pdf(
+                    score_json,
+                    dut_s,
+                    ref_s,
+                    mic_pick,
+                    model_line,
+                    PDF_RENDERER_VERSION,
+                )
+                st.download_button(
+                    "下载 PDF（与评测结果页一致）",
+                    data=_pdf_bytes,
+                    file_name=suggested_pdf_filename(model_line),
+                    mime="application/pdf",
+                    type="primary",
+                    key=f"dl_pdf_eval_{_idx}",
+                )
+            except Exception as _pdf_exc:
+                st.error(f"PDF 生成失败：{_pdf_exc}")
+    except ImportError as _pdf_imp:
+        st.caption(f"PDF 模块未加载：{_pdf_imp}")
+
     if export_format == "Word":
         st.caption(
             f"流水线 Word：`{docx_report_path}` ｜ Markdown：`{md_report_path}`"
@@ -2583,7 +2552,10 @@ if eval_mode == "dual_device":
         _imp_n = len(st.session_state.get("_dual_eval_import_paired") or [])
         if st.session_state.get("_dual_eval_running"):
             st.warning("🧠 Dify 评分进行中…")
-            st.caption("单轨上传+推理可能需数分钟；请展开页内「评分 [n/N]」状态条查看实时进度，下方运行日志在每轨结束后刷新。")
+            st.caption(
+                "单轨上传+推理可能需数分钟；请展开页内「评分 [n/N]」状态条查看实时进度，"
+                "下方「运行事件日志」在每轨结束后刷新。"
+            )
         elif _imp_n:
             st.success(f"✅ 已导入 {_imp_n} 对录音（清单）")
             st.caption("可点击右侧【手动开始测评】，无需重新采集")
@@ -2702,12 +2674,14 @@ if eval_mode == "dual_device":
                             st.audio(wav_path, format="audio/wav", sample_rate=SAMPLE_RATE)
                             st.caption(f"↑ {track_name}")
 
-st.subheader("📝 运行日志")
+st.subheader("📝 评测进度与运行记录")
 log_box = st.container(border=True)
 with log_box:
+    st.markdown("##### 📊 评测进度（子进程 · 五步）")
     st.caption(
-        "实时步骤：展示 **Dify 评测链路**（界面所选 Gemini 等为展示名，实际以 Dify 编排为准）。"
-        "子进程写入日志后约 **1s** 内刷新。"
+        "仅 **常规模式子进程评测** 时更新：采集 → Dify 评分 → 报告等阶段；"
+        "「评分计算」一行会显示上传/等模型等细粒度说明（约 **1s** 刷新）。"
+        "界面所选 Gemini 等为展示名，实际以 Dify 编排为准。"
     )
     _lp_now = st.session_state.get("_eval_live_log_path")
     if _lp_now and Path(_lp_now).is_file():
@@ -2726,16 +2700,26 @@ with log_box:
         else:
             _render_live_eval_timeline(_lp_now)
     elif _is_eval_running():
-        st.info("▶ 正在启动子进程，步骤条将随后显示…")
+        st.info("▶ 正在启动子进程，评测进度条将随后显示…")
     elif _is_nisqa_only_running():
         st.info(
             "▶ **NISQA 本地客观评分进行中**… 请稍候；可点击运行区「⏹ 停止 NISQA 评分」"
             "在**下一条**文件开始前中断（当前条推理无法强行打断）。"
         )
+    else:
+        st.caption("当前无子进程评测进度（双设备手动评分请看页内「评分 [n/N]」状态条 + 下方运行事件日志）。")
+
+    st.divider()
+    st.markdown("##### 📋 运行事件日志")
+    st.caption(
+        "记录本页操作与评分结果（启动、每轨成败、报告路径、Dify Key 对齐等）。"
+        "双设备手动评分时 **[Dify] 实时输出** 在页内「评分 [n/N]」状态条；"
+        "本区在每轨或每轮脚本结束后刷新。"
+    )
     st.checkbox(
-        "展开显示日志详情",
+        "展开运行事件全文",
         key="run_log_expand_details",
-        help="关闭时在固定大小日志框中紧凑显示；开启时可逐条展开查看详情。",
+        help="仅影响下方「运行事件日志」：关闭为紧凑标题列表；开启可逐条展开查看完整 detail。",
     )
     _render_run_logs_box()
 
@@ -3370,7 +3354,7 @@ if eval_mode == "dual_device" and st.session_state.get("_dual_eval_running", Fal
                     recov: list[dict[str, str]] = []
                     with st.status(
                         f"首模型全部失败：正在为其余 {len(emods_dd) - 1} 个模型请求 Dify（多轨；"
-                        "请展开本状态查看实时进度；上方「运行日志」在本阶段结束后才会刷新）",
+                        "请展开本状态查看实时进度；下方「运行事件日志」在本阶段结束后才会刷新）",
                         expanded=True,
                     ) as _mm_st:
                         try:
@@ -3392,7 +3376,7 @@ if eval_mode == "dual_device" and st.session_state.get("_dual_eval_running", Fal
                             _append_run_log("warning", "双设备·追加模型", str(ex))
                             try:
                                 _mm_st.update(
-                                    label="追加模型阶段出错（已记入运行日志）",
+                                    label="追加模型阶段出错（已记入运行事件日志）",
                                     state="error",
                                     expanded=True,
                                 )
@@ -3464,7 +3448,7 @@ if eval_mode == "dual_device" and st.session_state.get("_dual_eval_running", Fal
                         "info",
                         "多模型追加评分（双设备）",
                         f"主报告已生成；将按所选顺序，为另外 {len(emods_dd) - 1} 个模型**依次**对 {len(_paired_snapshot)} 条配对音轨逐轨请求 Dify。"
-                        "单模型异常会跳过并继续下一模型。请展开下方状态查看实时进度；运行日志区在本阶段结束后刷新。",
+                        "单模型异常会跳过并继续下一模型。请展开下方状态查看实时进度；运行事件日志在本阶段结束后刷新。",
                     )
                     try:
                         with st.status(
@@ -3488,7 +3472,7 @@ if eval_mode == "dual_device" and st.session_state.get("_dual_eval_running", Fal
                             _dmiss = _dd_exp - len(extra_dd)
                             _dw = (
                                 f"双设备多模型追加：预期 {_dd_exp} 个，实际完成 {len(extra_dd)} 个，"
-                                f"有 {_dmiss} 个未生成报告（详见运行日志）。"
+                                f"有 {_dmiss} 个未生成报告（详见运行事件日志）。"
                             )
                             _append_run_log("warning", "多模型追加（双设备）·部分失败", _dw)
                     except Exception as ex:

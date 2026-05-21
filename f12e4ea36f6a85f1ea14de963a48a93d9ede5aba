@@ -1,0 +1,42 @@
+项目设计说明书.md
+  h_b23a6a8439c0dd 1-472
+seedpace_audio_client.py
+  h_b23a6a8439c0dd 1-400
+双设备模式使用说明.md
+  h_b23a6a8439c0dd 1-244
+web_ui.py
+  h_b23a6a8439c0dd 1-2185
+双设备单麦对比模式使用说明.md
+  h_b23a6a8439c0dd 1-224
+difyclient.py
+  h_b23a6a8439c0dd 1-2003
+双设备模式实现总结.md
+  h_b23a6a8439c0dd 1-366
+web_ui_dify_api_keys_by_model.json.example
+  h_b23a6a8439c0dd 1-6
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.15",
+  "base_commit_sha": "f12e4ea36f6a85f1ea14de963a48a93d9ede5aba",
+  "prompts": {
+    "fbd0a7434a0e56c7": {
+      "agent_id": {
+        "tool": "known_human",
+        "id": "known_human_session",
+        "model": "unknown"
+      },
+      "human_author": "maocaiyun <maocaiyun@cvte.com>",
+      "messages": [],
+      "total_additions": 5917,
+      "total_deletions": 8,
+      "accepted_lines": 0,
+      "overriden_lines": 0
+    }
+  },
+  "humans": {
+    "h_b23a6a8439c0dd": {
+      "author": "unknown"
+    }
+  }
+}

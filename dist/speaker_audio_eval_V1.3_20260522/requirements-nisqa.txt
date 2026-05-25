@@ -1,0 +1,5 @@
+# 可选：本地 NISQA 客观音质评测（与主 requirements.txt 分离，避免默认安装 PyTorch）
+# 安装：pip install -r requirements-nisqa.txt
+# 权重：python scripts/setup_nisqa_weights.py
+
+nisqa==2.0.post2

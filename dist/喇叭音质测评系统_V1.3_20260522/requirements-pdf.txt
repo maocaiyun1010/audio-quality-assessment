@@ -1,0 +1,4 @@
+# Web UI PDF 导出：Windows 优先用本机 Edge 无头打印（中文正常）
+markdown>=3.5
+# 无 Edge/Chrome 时的备用（中文易出方框，不推荐）
+xhtml2pdf>=0.2.13

@@ -1,0 +1,6 @@
+{
+  "Gemini 3.1 Pro Preview": "app-REPLACE_WITH_DIFY_KEY_FOR_GEMINI_31_PRO",
+  "Gemini 2.5 Pro": "app-REPLACE_WITH_DIFY_KEY_FOR_GEMINI_25_PRO",
+  "Doubao-Seed-2.0-pro": "app-REPLACE_WITH_DIFY_KEY_FOR_DOUBAO_SEED_20_PRO",
+  "Doubao-Seed-2.0-Lite": "app-REPLACE_WITH_DIFY_KEY_FOR_DOUBAO_SEED_20_LITE"
+}

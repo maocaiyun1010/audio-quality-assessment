@@ -1,0 +1,19 @@
+# 本地 Dify 按模型专钥（勿提交仓库）
+web_ui_dify_api_keys_by_model.json
+# 本地「展示名 → 火山/Dify 实际 model ID」映射（可选；勿提交含内部 ep- 的敏感版本若政策要求）
+web_ui_provider_model_map.json
+
+# NISQA 权重（本地下载，勿提交）
+models/nisqa/*.tar
+
+# 勿在项目根创建空目录 nisqa/，会遮蔽 pip 包 nisqa
+/nisqa/
+
+# 运行产物与本地缓存
+output/
+.venv/
+__pycache__/
+*.py[cod]
+
+# 本地调试日志
+debug-*.log

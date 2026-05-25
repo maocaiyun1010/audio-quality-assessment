@@ -1,0 +1,5 @@
+{
+  "_comment": "复制为 web_ui_provider_model_map.json（勿提交含敏感信息的版本）。键=侧栏展示名或 SPEAKER_EVAL_MODEL_NAME；值=火山 Ark / Dify LLM 节点「模型」字段可用的 ID（以控制台 Endpoint 为准）。",
+  "Doubao-Seed-2.0-pro": "doubao-seed-2.0-pro",
+  "Doubao-Seed-2.0-Lite": "doubao-seed-2.0-lite"
+}

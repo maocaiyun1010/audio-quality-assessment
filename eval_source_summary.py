@@ -18,6 +18,14 @@ from markdown_report import DIMENSION_KEYS
 _DIMS: tuple[str, ...] = DIMENSION_KEYS
 
 
+def _sanitize_model_tag_for_filename(name: str) -> str:
+    s = "".join(
+        c if c.isalnum() or c in ("-", "_", ".") else "_"
+        for c in (name or "").strip()
+    )[:48]
+    return s or "model"
+
+
 def _scalar_str_for_cell(v: Any) -> str:
     """
     表格展示用纯文本：忽略 Dify/误解析产生的 JSON Schema 碎片（如 ``{"type": "string"}``），
@@ -45,23 +53,130 @@ def _scalar_str_for_cell(v: Any) -> str:
     return str(v).strip()
 
 
+def session_base_from_web_scores_stem(stem: str) -> str:
+    """``web_ui_scores_{base}.json`` 或 ``web_ui_scores_{base}__{tag}.json`` → ``base``。"""
+    prefix = "web_ui_scores_"
+    if not stem.startswith(prefix):
+        return ""
+    rest = stem[len(prefix) :]
+    if "__" in rest:
+        return rest.rsplit("__", 1)[0]
+    return rest
+
+
+def _read_web_ui_score_meta(score_json_path: Path) -> dict[str, Any]:
+    if not score_json_path.is_file():
+        return {}
+    try:
+        raw = json.loads(score_json_path.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else {}
+    except Exception:
+        return {}
+
+
+def _analysis_path_from_score_meta(meta: Mapping[str, Any]) -> Path | None:
+    """优先 score JSON 内 ``analysis_json``；路径失效时按 basename 在 analysis 目录查找。"""
+    from config import ANALYSIS_DIR
+
+    for key in ("analysis_json", "analysis_path"):
+        ap = str(meta.get(key) or "").strip()
+        if not ap:
+            continue
+        p = Path(ap)
+        if p.is_file():
+            return p
+        alt = ANALYSIS_DIR / p.name
+        if alt.is_file():
+            return alt
+    return None
+
+
+def _glob_analysis_for_primary_session(safe: str, eval_model: str = "") -> Path | None:
+    """主会话 ``web_ui_scores_{safe}.json``（无 ``__tag``）的 analysis 配对，避免误取其它模型最新文件。"""
+    from config import ANALYSIS_DIR
+
+    cands = list(ANALYSIS_DIR.glob(f"analysis_{safe}_*.json"))
+    if not cands:
+        return None
+
+    tag = _sanitize_model_tag_for_filename(eval_model) if eval_model else ""
+    if tag:
+        tagged = [
+            p
+            for p in cands
+            if f"__{tag}" in p.stem or p.stem.endswith(f"__{tag}")
+        ]
+        if tagged:
+            return sorted(tagged, key=lambda p: p.stat().st_mtime, reverse=True)[0]
+
+    if safe.startswith("dual_webui_"):
+        main_cands = [p for p in cands if "_main__" in p.stem]
+        if main_cands:
+            return sorted(main_cands, key=lambda p: p.stat().st_mtime, reverse=True)[0]
+
+    filtered = [p for p in cands if "多设备对比__" not in p.stem]
+    if filtered:
+        return sorted(filtered, key=lambda p: p.stat().st_mtime, reverse=True)[0]
+    return sorted(cands, key=lambda p: p.stat().st_mtime, reverse=True)[0]
+
+
+def discover_session_web_ui_score_paths(
+    anchor: Path,
+    *,
+    analysis_dir: Path | None = None,
+) -> list[Path]:
+    """
+    同一会话下全部 ``web_ui_scores``（含多模型 ``__tag`` 后缀）。
+    ``anchor`` 排在首位（历史预览时为用户所选文件）。
+    """
+    from config import ANALYSIS_DIR
+
+    root = analysis_dir or ANALYSIS_DIR
+    base = session_base_from_web_scores_stem(anchor.stem)
+    if not base:
+        return [anchor.resolve()] if anchor.is_file() else []
+
+    ordered: list[Path] = []
+    primary = root / f"web_ui_scores_{base}.json"
+    if primary.is_file():
+        ordered.append(primary.resolve())
+    ordered.extend(
+        sorted(
+            (p.resolve() for p in root.glob(f"web_ui_scores_{base}__*.json") if p.is_file()),
+            key=lambda p: p.name,
+        )
+    )
+
+    out: list[Path] = []
+    seen: set[str] = set()
+    anchor_r = anchor.resolve()
+    if anchor_r.is_file():
+        out.append(anchor_r)
+        seen.add(str(anchor_r))
+    for p in ordered:
+        key = str(p)
+        if key not in seen:
+            out.append(p)
+            seen.add(key)
+    return out
+
+
 def analysis_json_path_for_web_scores(score_json_path: Path) -> Path | None:
     """
-    由 ``output/analysis/web_ui_scores_{safe}.json`` 解析对应 ``analysis_{safe}_*.json``（取最新 mtime）。
+    由 ``output/analysis/web_ui_scores_{safe}.json`` 解析对应 ``analysis_{safe}_*.json``。
 
-    其中 ``{safe}`` 为 stem 去掉前缀 ``web_ui_scores_`` 后的整段，例如：
-
-    - 常规子进程：**``manual_YYYYMMDD_HHMMSS``** 等；
-    - **Web 双设备单麦**：**``dual_webui_YYYYMMDD_HHMMSS``**，对应 ``analysis_dual_webui_*_*.json``；
-    - 多模型追加：``{safe}`` 中常含 ``__模型标签``，仍按 ``analysis_{safe}_*.json`` 配对。
-
-    兼容旧版双设备命名 ``web_ui_scores_dual_device_*.json`` → ``analysis_dual_device_webui_*.json``。
+    优先 score JSON 内 ``analysis_json`` 字段；glob 时按模型 tag / 会话类型过滤，避免多模型误配。
     """
     stem = score_json_path.stem
     prefix = "web_ui_scores_"
     if not stem.startswith(prefix):
         return None
     from config import ANALYSIS_DIR
+
+    meta = _read_web_ui_score_meta(score_json_path)
+    from_meta = _analysis_path_from_score_meta(meta)
+    if from_meta is not None:
+        return from_meta
 
     if stem.startswith("web_ui_scores_dual_device_"):
         cands = sorted(
@@ -72,12 +187,24 @@ def analysis_json_path_for_web_scores(score_json_path: Path) -> Path | None:
         return cands[0] if cands else None
 
     safe = stem[len(prefix) :]
-    cands = sorted(
-        ANALYSIS_DIR.glob(f"analysis_{safe}_*.json"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    return cands[0] if cands else None
+    eval_model = str(meta.get("web_ui_eval_model") or meta.get("eval_model") or "").strip()
+
+    # 多模型：web_ui_scores_{session}__{tag} → analysis_{session}_*__{tag}[_ts].json
+    if "__" in safe:
+        base, model_tag = safe.rsplit("__", 1)
+        if base and model_tag:
+            mm_cands = sorted(
+                set(
+                    ANALYSIS_DIR.glob(f"analysis_{base}_*__{model_tag}_*.json")
+                )
+                | set(ANALYSIS_DIR.glob(f"analysis_{base}_*__{model_tag}.json")),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if mm_cands:
+                return mm_cands[0]
+
+    return _glob_analysis_for_primary_session(safe, eval_model)
 
 
 _BOOKTITLE_IN_NAME_RE = re.compile(r"《([^》]+)》")
@@ -273,17 +400,6 @@ def dimension_averages_1f(df: pd.DataFrame) -> dict[str, float]:
 def load_analysis_from_score_json_path(score_json_path: str | Path) -> dict[str, Any] | None:
     """读取与本次 Web UI 分数 JSON 同会话的 analysis JSON；失败返回 None。"""
     p = Path(score_json_path)
-    if p.is_file():
-        try:
-            meta = json.loads(p.read_text(encoding="utf-8"))
-            if isinstance(meta, dict):
-                ap = str(meta.get("analysis_json") or meta.get("analysis_path") or "").strip()
-                if ap:
-                    apth = Path(ap)
-                    if apth.is_file():
-                        return json.loads(apth.read_text(encoding="utf-8"))
-        except Exception:
-            pass
     aj = analysis_json_path_for_web_scores(p)
     if aj is None or not aj.is_file():
         return None

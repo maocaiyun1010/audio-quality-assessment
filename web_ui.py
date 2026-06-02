@@ -2,6 +2,7 @@
 """Streamlit Web UI：双机全流程评测、五维汇总、报告导出、提示词查阅、设备与麦克风选择。"""
 from __future__ import annotations
 
+import hashlib
 import html
 import inspect
 import json
@@ -23,7 +24,9 @@ import streamlit as st
 import config
 from config import EVAL_METRICS
 from eval_source_summary import (
+    analysis_json_path_for_web_scores,
     build_per_track_rows,
+    discover_session_web_ui_score_paths,
     load_analysis_from_score_json_path,
     rows_to_dataframe,
 )
@@ -88,6 +91,61 @@ def _recorded_session_ready(session_safe: str) -> bool:
     return any(RECORDED_DIR.glob(f"{s}_*.wav"))
 
 
+def _eval_pdf_cache_token(score_json: str) -> str:
+    """Streamlit PDF 缓存键：绑定 score/analysis 文件内容与 mtime，避免历史切换共用旧 PDF。"""
+    p = Path(score_json)
+    if not p.is_file():
+        return f"missing|{score_json}"
+    parts: list[str] = [str(p.resolve())]
+    try:
+        raw = p.read_bytes()
+        parts.append(str(p.stat().st_mtime_ns))
+        parts.append(hashlib.sha256(raw).hexdigest()[:20])
+    except OSError:
+        parts.append("stat_err")
+    try:
+        from eval_source_summary import analysis_json_path_for_web_scores
+
+        apth = analysis_json_path_for_web_scores(p)
+        if apth is not None and apth.is_file():
+            parts.extend([str(apth.resolve()), str(apth.stat().st_mtime_ns)])
+            parts.append(hashlib.sha256(apth.read_bytes()).hexdigest()[:20])
+    except Exception:
+        pass
+    return "|".join(parts)
+
+
+@st.cache_data(show_spinner="正在生成 PDF（与评测结果页一致）…")
+def _cached_eval_report_pdf_bytes(
+    cache_token: str,
+    score_json: str,
+    analysis_json: str,
+    dut: str,
+    ref: str,
+    mic: str,
+    model: str,
+    pdf_ver: str,
+) -> bytes:
+    """
+    生成评测 PDF 字节流。
+
+    注意：``@st.cache_data`` 会忽略以下划线开头的参数名，因此缓存键参数不得使用 ``_`` 前缀。
+    """
+    from web_ui_report_pdf import build_eval_report_pdf
+
+    pdf_b, pdf_msg = build_eval_report_pdf(
+        score_json_path=score_json,
+        dut_s=dut,
+        ref_s=ref,
+        mic_pick=mic,
+        model_line=model,
+        analysis_json_path=analysis_json or None,
+    )
+    if pdf_b is None:
+        raise RuntimeError(pdf_msg)
+    return pdf_b
+
+
 def _resolve_pipeline_report_paths(report_path: str) -> tuple[Path, Path]:
     """
     返回 (流水线 Markdown 路径, Word .docx 路径)。
@@ -110,6 +168,38 @@ def _resolve_pipeline_report_paths(report_path: str) -> tuple[Path, Path]:
     return base.with_suffix(".md"), base.with_suffix(".docx")
 
 
+def _extra_model_reports_from_score_paths(
+    anchor: Path,
+    sibling_paths: list[Path],
+) -> tuple[list[str], list[dict[str, str]]]:
+    """由同会话 score JSON 列表构造 ``eval_models`` 与 ``extra_model_reports``（不含 anchor）。"""
+    from config import REPORT_DIR
+
+    eval_models: list[str] = []
+    extras: list[dict[str, str]] = []
+    anchor_r = anchor.resolve()
+    for p in sibling_paths:
+        model = _model_label_from_web_scores_path(p)
+        eval_models.append(model or p.stem)
+        if p.resolve() == anchor_r:
+            continue
+        analysis_p = analysis_json_path_for_web_scores(p)
+        if analysis_p is not None and analysis_p.is_file():
+            md_candidate = REPORT_DIR / f"声学评测报告_{analysis_p.stem}.md"
+            report_path = str(md_candidate if md_candidate.is_file() else analysis_p)
+        else:
+            report_path = str(p)
+        extras.append(
+            {
+                "model": model or p.stem,
+                "score_json": str(p.resolve()),
+                "markdown": report_path,
+                "report_path": report_path,
+            }
+        )
+    return eval_models, extras
+
+
 def _build_demo_eval_payload(score_json_path: Path, export_format: str) -> dict | None:
     """
     由历史 ``web_ui_scores_*.json`` 构造与真实评测成功时等价的 session payload，
@@ -121,8 +211,7 @@ def _build_demo_eval_payload(score_json_path: Path, export_format: str) -> dict 
         pass
     if not score_json_path.is_file():
         return None
-    from config import REPORT_DIR
-    from eval_source_summary import analysis_json_path_for_web_scores
+    from config import ANALYSIS_DIR, REPORT_DIR
 
     analysis_p = analysis_json_path_for_web_scores(score_json_path)
     if analysis_p is not None and analysis_p.is_file():
@@ -150,22 +239,35 @@ def _build_demo_eval_payload(score_json_path: Path, export_format: str) -> dict 
         except Exception:
             pass
 
+    session_scores = discover_session_web_ui_score_paths(
+        score_json_path, analysis_dir=ANALYSIS_DIR
+    )
+    eval_models, extra_reports = _extra_model_reports_from_score_paths(
+        score_json_path, session_scores
+    )
+
     payload: dict = {
         "dut_s": dut_s,
         "ref_s": ref_s,
         "mic_pick": "（历史数据预览·未重新采集）",
         "export_format": export_format,
         "report_path": report_path,
-        "score_json": str(score_json_path),
+        "score_json": str(score_json_path.resolve()),
+        "hist_preview": True,
     }
-    try:
-        score_blob = json.loads(score_json_path.read_text(encoding="utf-8"))
-        if isinstance(score_blob, dict):
-            wm = str(score_blob.get("web_ui_eval_model") or "").strip()
-            if wm:
-                payload["eval_models"] = [wm]
-    except Exception:
-        pass
+    if eval_models:
+        payload["eval_models"] = eval_models
+    if extra_reports:
+        payload["extra_model_reports"] = extra_reports
+    elif not eval_models:
+        try:
+            score_blob = json.loads(score_json_path.read_text(encoding="utf-8"))
+            if isinstance(score_blob, dict):
+                wm = str(score_blob.get("web_ui_eval_model") or "").strip()
+                if wm:
+                    payload["eval_models"] = [wm]
+        except Exception:
+            pass
     return payload
 
 
@@ -1164,6 +1266,13 @@ def _render_eval_results(
 ) -> None:
     """评测成功后渲染图表与报告（原 ``if start`` 内逻辑）。"""
     extras = list(extra_model_reports or [])
+    if not extras:
+        try:
+            _sibs = discover_session_web_ui_score_paths(Path(score_json))
+            if len(_sibs) > 1:
+                _, extras = _extra_model_reports_from_score_paths(Path(score_json), _sibs)
+        except Exception:
+            pass
     if eval_models:
         em_list = list(eval_models)
     else:
@@ -1184,9 +1293,11 @@ def _render_eval_results(
             meta0 = json.load(f0)
     except Exception:
         meta0 = {}
-    prim_lbl = str(meta0.get("web_ui_eval_model") or "").strip()
-    if em_list:
-        prim_lbl = str(em_list[0] or "").strip() or prim_lbl
+    prim_lbl = str(meta0.get("web_ui_eval_model") or meta0.get("eval_model") or "").strip()
+    if not prim_lbl:
+        prim_lbl = _model_label_from_web_scores_path(Path(score_json))
+    if not prim_lbl and em_list:
+        prim_lbl = str(em_list[0] or "").strip() or "评测模型"
     if not prim_lbl:
         prim_lbl = "评测模型"
     bundles.append({"label": prim_lbl, "score_json": score_json, "report_path": report_path})
@@ -1269,6 +1380,7 @@ def _render_eval_results(
     score_json = b["score_json"]
     report_path = b["report_path"]
     model_line = b["label"]
+    _pdf_key_stem = Path(score_json).stem
 
     with open(score_json, encoding="utf-8") as f:
         data = json.load(f)
@@ -1600,7 +1712,6 @@ def _render_eval_results(
     try:
         from web_ui_report_pdf import (
             PDF_RENDERER_VERSION,
-            build_eval_report_pdf,
             pdf_export_available,
             pdf_render_backend_label,
             suggested_pdf_filename,
@@ -1611,29 +1722,26 @@ def _render_eval_results(
         else:
             st.caption(f"PDF 渲染：{pdf_render_backend_label()}")
 
-            @st.cache_data(show_spinner="正在生成 PDF（与评测结果页一致）…")
-            def _cached_eval_pdf(
-                _score_json: str,
-                _dut: str,
-                _ref: str,
-                _mic: str,
-                _model: str,
-                _pdf_ver: str,
-            ) -> bytes:
-                pdf_b, pdf_msg = build_eval_report_pdf(
-                    score_json_path=_score_json,
-                    dut_s=_dut,
-                    ref_s=_ref,
-                    mic_pick=_mic,
-                    model_line=_model,
+            _analysis_for_pdf = analysis_json_path_for_web_scores(Path(score_json))
+            _analysis_pdf_str = (
+                str(_analysis_for_pdf.resolve())
+                if _analysis_for_pdf is not None and _analysis_for_pdf.is_file()
+                else ""
+            )
+            st.caption(
+                f"PDF 与**当前视图**一致 · 分数 `{Path(score_json).name}`"
+                + (
+                    f" · analysis `{_analysis_for_pdf.name}`"
+                    if _analysis_for_pdf is not None
+                    else " · （未配对 analysis）"
                 )
-                if pdf_b is None:
-                    raise RuntimeError(pdf_msg)
-                return pdf_b
+            )
 
             try:
-                _pdf_bytes = _cached_eval_pdf(
+                _pdf_bytes = _cached_eval_report_pdf_bytes(
+                    _eval_pdf_cache_token(score_json),
                     score_json,
+                    _analysis_pdf_str,
                     dut_s,
                     ref_s,
                     mic_pick,
@@ -1641,12 +1749,12 @@ def _render_eval_results(
                     PDF_RENDERER_VERSION,
                 )
                 st.download_button(
-                    "下载 PDF（与评测结果页一致）",
+                    f"下载 PDF（当前视图 · {model_line}）",
                     data=_pdf_bytes,
                     file_name=suggested_pdf_filename(model_line),
                     mime="application/pdf",
                     type="primary",
-                    key=f"dl_pdf_eval_{_idx}",
+                    key=f"dl_pdf_eval_{_pdf_key_stem}",
                 )
             except Exception as _pdf_exc:
                 st.error(f"PDF 生成失败：{_pdf_exc}")
@@ -2261,6 +2369,10 @@ with st.sidebar:
         if st.button("加载到报告界面", width="stretch", key="demo_load_hist_btn"):
             _demo = _build_demo_eval_payload(_sel_hist, export_format)
             if _demo:
+                try:
+                    _cached_eval_report_pdf_bytes.clear()
+                except Exception:
+                    pass
                 st.session_state["_eval_success_payload"] = _demo
                 st.session_state.pop("_eval_error_msg", None)
                 st.rerun()

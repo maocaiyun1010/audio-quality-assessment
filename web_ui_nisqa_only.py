@@ -19,6 +19,22 @@ from config import RECORDED_DIR
 from speaker_eval.settings.paths import AUDIO_EXTENSIONS, OUTPUT_DIR
 
 
+@st.cache_data(show_spinner="正在生成 NISQA PDF…")
+def _cached_nisqa_report_pdf_bytes(
+    payload_json: str,
+    eval_mode: str,
+    pdf_ver: str,
+) -> bytes:
+    """参数名勿以下划线开头，否则 ``@st.cache_data`` 不会将其纳入缓存键。"""
+    from web_ui_report_pdf import build_nisqa_only_report_pdf
+
+    payload = json.loads(payload_json)
+    pdf_b, pdf_msg = build_nisqa_only_report_pdf(payload, eval_mode=eval_mode)
+    if pdf_b is None:
+        raise RuntimeError(pdf_msg)
+    return pdf_b
+
+
 def collect_nisqa_input_paths(
     *,
     eval_mode: str,
@@ -582,22 +598,8 @@ def render_nisqa_only_results(
                     payload, ensure_ascii=False, sort_keys=True, default=str
                 )
 
-                @st.cache_data(show_spinner="正在生成 NISQA PDF…")
-                def _cached_nisqa_pdf(
-                    _payload_json: str,
-                    _eval_mode: str,
-                    _pdf_ver: str,
-                ) -> bytes:
-                    _p = json.loads(_payload_json)
-                    pdf_b, pdf_msg = build_nisqa_only_report_pdf(
-                        _p, eval_mode=_eval_mode
-                    )
-                    if pdf_b is None:
-                        raise RuntimeError(pdf_msg)
-                    return pdf_b
-
                 try:
-                    _nisqa_pdf = _cached_nisqa_pdf(
+                    _nisqa_pdf = _cached_nisqa_report_pdf_bytes(
                         _payload_key,
                         eval_mode or "",
                         PDF_RENDERER_VERSION,

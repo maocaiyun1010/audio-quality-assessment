@@ -43,7 +43,7 @@ from web_ui_report_html import _DIM_SCORE_SHORT, diff_accent_color
 
 _PDF_DEPS_HINT = "请执行：pip install -r requirements-pdf.txt"
 # 用于 streamlit 缓存失效；字体/渲染策略变更时递增
-PDF_RENDERER_VERSION = "20260521_edge_v4_nisqa_ui"
+PDF_RENDERER_VERSION = "20260602_hist_json_pdf_v3"
 
 _HEADLESS_BROWSER_CANDIDATES: tuple[tuple[str, str], ...] = (
     ("edge", r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
@@ -446,6 +446,7 @@ def build_eval_report_pdf(
     ref_s: str,
     mic_pick: str,
     model_line: str,
+    analysis_json_path: str | Path | None = None,
 ) -> tuple[bytes | None, str]:
     """
     生成与 Web UI 评测结果页一致的 PDF。
@@ -464,6 +465,9 @@ def build_eval_report_pdf(
             data = json.load(f)
     except Exception as exc:
         return None, f"读取评分 JSON 失败：{exc}"
+
+    json_model = str(data.get("web_ui_eval_model") or data.get("eval_model") or "").strip()
+    display_model = json_model or (model_line or "").strip() or "评测模型"
 
     pairwise = bool(data.get("comparison_mode") or data.get("stimulus_pairwise"))
     dut_avg = np.array([float(data["dut_scores"][m]) for m in EVAL_METRICS])
@@ -490,7 +494,7 @@ def build_eval_report_pdf(
     sections.append(
         f"<h1>喇叭测试报告 · AI学习机智能音效评测</h1>"
         f'<p class="note">生成时间：{html.escape(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))}</p>'
-        f"<p><b>评测模型</b>：{html.escape(model_line)}</p>"
+        f"<p><b>评测模型</b>：{html.escape(display_model)}</p>"
         f"<p><b>被测</b>：{html.escape(dut_s)}<br/>"
         f"<b>对比</b>：{html.escape(ref_s)}<br/>"
         f"<b>麦克风</b>：{html.escape(mic_pick)}</p>"
@@ -514,7 +518,16 @@ def build_eval_report_pdf(
         )
     )
 
-    analysis = load_analysis_from_score_json_path(path)
+    analysis: dict[str, Any] | None = None
+    if analysis_json_path:
+        ap = Path(analysis_json_path)
+        if ap.is_file():
+            try:
+                analysis = json.loads(ap.read_text(encoding="utf-8"))
+            except Exception:
+                analysis = None
+    if analysis is None:
+        analysis = load_analysis_from_score_json_path(path)
     rows: list[dict[str, Any]] = []
     section_six_md = ""
     six_ctx: dict[str, Any] | None = None

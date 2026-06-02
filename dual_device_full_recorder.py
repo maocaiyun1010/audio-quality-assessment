@@ -217,6 +217,155 @@ class DualDeviceFullRecorder:
     def is_complete(self) -> bool:
         """两段设备是否都完成录制"""
         return self.is_device_a_complete and self.is_device_b_complete
+
+    @property
+    def device_a_has_partial(self) -> bool:
+        """被测设备 A 已有进度但未全部成功（可续录）。"""
+        return bool(self._device_a_results) and not self.is_device_a_complete
+
+    @property
+    def device_b_has_partial(self) -> bool:
+        """对比设备 B 已有进度但未全部成功（可续录）。"""
+        return bool(self._device_b_results) and not self.is_device_b_complete
+
+    @staticmethod
+    def _track_entry_ok(entry: dict | None) -> bool:
+        if not entry or not entry.get("ok"):
+            return False
+        wav = str(entry.get("local_wav") or "").strip()
+        return bool(wav) and Path(wav).is_file()
+
+    @staticmethod
+    def _index_existing_results(existing: list[dict]) -> dict[int, dict]:
+        out: dict[int, dict] = {}
+        for row in existing or []:
+            try:
+                out[int(row.get("track_index") or 0)] = row
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def _build_track_plan(self, tracks: list[tuple[str, str]]) -> list[tuple[str, str, str]]:
+        plan: list[tuple[str, str, str]] = []
+        for i, (group, rel) in enumerate(tracks, start=1):
+            ext = Path(rel).suffix.lower()
+            remote_base = f"track_{i:03d}{ext}"
+            plan.append((group, rel, remote_base))
+        return plan
+
+    def _commit_side_results(
+        self,
+        side: str,
+        results: list[dict],
+        *,
+        save_playlist: bool = True,
+    ) -> None:
+        if side == "A":
+            self._device_a_results = list(results)
+        else:
+            self._device_b_results = list(results)
+        if save_playlist:
+            self._save_playlist()
+
+    def _record_tracks_for_device(
+        self,
+        *,
+        side: str,
+        device: AdbDevice,
+        device_serial: str,
+        plan: list[tuple[str, str, str]],
+        duration: float,
+        existing_results: list[dict],
+    ) -> tuple[bool, str]:
+        """按 plan 录制；跳过已成功条目，失败时保留进度供续录。"""
+        existing_by_idx = self._index_existing_results(existing_results)
+        results: list[dict] = []
+        n_plan = len(plan)
+        role = "被测设备A" if side == "A" else "对比设备B"
+
+        need_push: list[tuple[int, str, str, str]] = []
+        for idx, (group, rel, remote_base) in enumerate(plan, start=1):
+            if not self._track_entry_ok(existing_by_idx.get(idx)):
+                need_push.append((idx, group, rel, remote_base))
+
+        if need_push:
+            self.log(f"📤 推送待录制音源到设备（{len(need_push)}/{n_plan} 条）…")
+        else:
+            self.log(f"📤 全部 {n_plan} 条已在设备侧，跳过推送")
+
+        for idx, group, rel, remote_base in need_push:
+            src = ASSETS_AUDIO_DIR / rel
+            ok_push, msg_push = self._push_one_track_with_logs(
+                device=device,
+                src=src,
+                remote_base=remote_base,
+                group=group,
+                rel=rel,
+            )
+            if not ok_push:
+                self._commit_side_results(
+                    side, results if results else list(existing_results)
+                )
+                return False, msg_push
+
+        self.log("🎵 开始按节目录制…")
+        for idx, (group, rel, remote_base) in enumerate(plan, start=1):
+            prev = existing_by_idx.get(idx)
+            if self._track_entry_ok(prev):
+                self.log(f"\n[音源 {idx}/{n_plan}] {group} / {rel}")
+                self.log(f"  ⏭️ 跳过已成功: {Path(str(prev.get('local_wav'))).name}")
+                results.append(dict(prev))
+                continue
+
+            stem_safe = "".join(
+                c if c.isalnum() or c in ("-", "_") else "_" for c in rel
+            )[:50]
+            if prev and str(prev.get("local_wav") or "").strip():
+                out_path = Path(str(prev["local_wav"]))
+            else:
+                out_name = f"{self._safe_tag}_{side}_{idx:02d}_{group}_{stem_safe}.wav"
+                out_path = RECORDED_DIR / out_name
+
+            self.log(f"\n[音源 {idx}/{n_plan}] {group} / {rel}")
+
+            ok, msg = self._record_one_track(
+                device,
+                remote_base,
+                out_path,
+                duration,
+                source_path=ASSETS_AUDIO_DIR / rel,
+            )
+
+            result = {
+                "track_index": idx,
+                "group": group,
+                "filename": rel,
+                "local_wav": str(out_path),
+                "ok": ok,
+                "message": msg,
+                "device": side,
+                "device_serial": device_serial,
+            }
+            results.append(result)
+
+            if ok:
+                self.log(f"  ✅ 录制成功: {out_path.name}")
+            else:
+                self.log(f"  ❌ 录制失败: {msg}")
+                self._commit_side_results(side, results)
+                n_ok = sum(1 for r in results if r.get("ok"))
+                return (
+                    False,
+                    f"音源 {idx}/{n_plan} 录制失败: {msg}（已成功 {n_ok}/{n_plan} 条，"
+                    f"可点击续录【{role}】从本条重试）",
+                )
+
+            if idx < n_plan:
+                time.sleep(0.2)
+
+        self._commit_side_results(side, results)
+        self.log(f"\n✅ 【{role}】所有音源录制完成！")
+        return True, "ok"
     
     @property
     def playlist_path(self) -> Optional[Path]:
@@ -298,42 +447,38 @@ class DualDeviceFullRecorder:
             
             # 【自动化】PC 端直接触发设备播放
             self.log(f"🎵 正在通过 ADB 触发播放: {remote_basename}...")
+            play_error: list[str | None] = [None]
             try:
-                # 1. 确保屏幕亮起并解锁（防止锁屏导致播放失败）
                 device.shell("input keyevent KEYCODE_WAKEUP", timeout=5)
-                device.shell("input keyevent KEYCODE_MENU", timeout=5) # 尝试解锁/唤醒界面
+                device.shell("input keyevent KEYCODE_MENU", timeout=5)
 
-                # 2. 多策略触发播放（含详细回执日志）
                 ok_play, msg_play = self._trigger_device_playback(device, remote_basename)
                 if ok_play:
                     self.log(f"✅ {msg_play}")
                 else:
-                    self.log(f"⚠️ {msg_play}")
+                    play_error[0] = msg_play or "设备播放触发失败"
+                    self.log(f"❌ {play_error[0]}")
             except Exception as play_err:
-                self.log(f"⚠️ ADB 自动播放触发异常，请检查设备状态: {play_err}")
+                play_error[0] = f"ADB 自动播放触发异常: {play_err}"
+                self.log(f"❌ {play_error[0]}")
 
-            # 等待录制时长
+            # 等待有效播放段（整曲模式须播满探测时长+尾缓冲，不可提前停播）
             self.log(f"⏳ 录制进行中，持续 {effective_duration:.2f} 秒...")
             _release = clean_shell_text(device.shell("getprop ro.build.version.release", timeout=5))
             _sdk = clean_shell_text(device.shell("getprop ro.build.version.sdk", timeout=5))
             _platform = clean_shell_text(device.shell("getprop ro.board.platform", timeout=5))
             _is_mtk_android10 = ("mt" in _platform.lower()) and (_sdk == "29" or _release.startswith("10"))
             used_hard_stop = False
-            if full_mode and _is_mtk_android10 and effective_duration > 1.2:
-                # MTK Android10 + MediaPlaybackActivity 在自然播完瞬间偶发自动重播：
-                # 提前硬停（避免触发 onComplete）+ 尾段轻量抑制（避免立刻二次拉起）。
-                lead_stop = 1.0
-                time.sleep(max(0.2, effective_duration - lead_stop))
-                halt_device_audio_playback(device, self.log, reason="MTK Android10 完整播放防重播预停")
+            time.sleep(max(0.0, float(effective_duration)))
+            if full_mode and _is_mtk_android10:
+                # 播满后再停：避免提前 1s 截断尾音；结束后立即硬停以防 MediaPlaybackActivity 自动重播
+                halt_device_audio_playback(
+                    device, self.log, reason="MTK Android10 完整播放结束防重播"
+                )
                 used_hard_stop = True
-                tail_guard_total = max(0.25, lead_stop)
-                guard_step = 0.2
-                loops = max(1, int(tail_guard_total / guard_step))
-                for _ in range(loops):
-                    time.sleep(guard_step)
+                for _ in range(2):
+                    time.sleep(0.2)
                     _halt_playback_quick(device, self.log, reason="MTK Android10 尾段防重播抑制")
-            else:
-                time.sleep(effective_duration)
 
             # 录音线程为实时采集，总墙钟 ≈ total_seconds；分块 PortAudio 会略有余量。
             # 注意：``Thread.join()`` 在 Python 中始终返回 ``None``，不能用 ``if not th.join()`` 判断超时。
@@ -354,6 +499,8 @@ class DualDeviceFullRecorder:
             else:
                 halt_device_audio_playback(device, self.log, reason="本条录制结束")
             
+            if play_error[0]:
+                return False, f"设备播放触发失败: {play_error[0]}"
             if error_box[0]:
                 return False, f"录制失败: {error_box[0]}"
             
@@ -438,95 +585,42 @@ class DualDeviceFullRecorder:
         self.log("=" * 60)
         
         ensure_output_dirs()
-        
-        # 1. 扫描音源
+
+        if self.device_a_has_partial:
+            n_ok = sum(1 for r in self._device_a_results if r.get("ok"))
+            self.log(
+                f"🔁 续录模式：已有 {n_ok}/{len(self._device_a_results)} 条成功，"
+                "将跳过已成功音源并从失败处继续"
+            )
+
         tracks = discover_standard_tracks()
         self.log(f"🔍 扫描音源目录: {ASSETS_AUDIO_DIR}")
         self.log(f"📋 发现音源数量: {len(tracks)}")
         if not tracks:
-            # 尝试列出目录内容以便调试
             if ASSETS_AUDIO_DIR.exists():
-                files = list(ASSETS_AUDIO_DIR.rglob("*.mp3")) + list(ASSETS_AUDIO_DIR.rglob("*.wav"))
+                files = list(ASSETS_AUDIO_DIR.rglob("*.mp3")) + list(
+                    ASSETS_AUDIO_DIR.rglob("*.wav")
+                )
                 self.log(f"⚠️ 目录下实际存在的音频文件: {[f.name for f in files]}")
             return False, f"未发现音源：请将 wav/mp3 等放入 {ASSETS_AUDIO_DIR}"
-        
+
         self.log(f"✅ 准备录制 {len(tracks)} 个音源文件")
-        
-        # 2. 连接设备
+
         try:
             device = adbutils.adb.device(device_serial)
             self.log(f"✅ 已连接设备: {device_serial}")
         except Exception as exc:
             return False, f"连接设备失败: {exc}"
-        
-        # 3. 推送音源到设备
-        self.log("📤 推送音源到设备...")
-        plan = []
-        for i, (group, rel) in enumerate(tracks, start=1):
-            ext = Path(rel).suffix.lower()
-            remote_base = f"track_{i:03d}{ext}"
-            plan.append((group, rel, remote_base))
-        
-        for group, rel, remote_base in plan:
-            src = ASSETS_AUDIO_DIR / rel
-            ok_push, msg_push = self._push_one_track_with_logs(
-                device=device,
-                src=src,
-                remote_base=remote_base,
-                group=group,
-                rel=rel,
-            )
-            if not ok_push:
-                return False, msg_push
-        
-        # 4. 按节目循环：播放 + PC录音
-        self.log("🎵 开始按节目录制...")
-        results = []
-        
-        for idx, (group, rel, remote_base) in enumerate(plan, start=1):
-            stem_safe = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in rel)[:50]
-            out_name = f"{self._safe_tag}_A_{idx:02d}_{group}_{stem_safe}.wav"
-            out_path = RECORDED_DIR / out_name
-            
-            self.log(f"\n[音源 {idx}/{len(plan)}] {group} / {rel}")
-            
-            ok, msg = self._record_one_track(
-                device,
-                remote_base,
-                out_path,
-                duration,
-                source_path=ASSETS_AUDIO_DIR / rel,
-            )
-            
-            result = {
-                "track_index": idx,
-                "group": group,
-                "filename": rel,
-                "local_wav": str(out_path),
-                "ok": ok,
-                "message": msg,
-                "device": "A",
-                "device_serial": device_serial,
-            }
-            results.append(result)
-            
-            if ok:
-                self.log(f"  ✅ 录制成功: {out_name}")
-            else:
-                self.log(f"  ❌ 录制失败: {msg}")
-                return False, f"音源 {idx} 录制失败: {msg}"
-            
-            # 音源之间稍作停顿
-            if idx < len(plan):
-                time.sleep(0.2)
-        
-        self._device_a_results = results
-        self.log("\n✅ 【被测设备A】所有音源录制完成！")
-        
-        # 5. 生成播放清单
-        self._save_playlist()
-        
-        return True, "ok"
+
+        plan = self._build_track_plan(tracks)
+        return self._record_tracks_for_device(
+            side="A",
+            device=device,
+            device_serial=device_serial,
+            plan=plan,
+            duration=duration,
+            existing_results=list(self._device_a_results),
+        )
     
     def record_device_b(
         self,
@@ -545,95 +639,45 @@ class DualDeviceFullRecorder:
         """
         if not self._device_a_results:
             return False, "必须先录制【被测设备A】，才能录制【对比设备B】"
-        
+        if not self.is_device_a_complete:
+            return False, (
+                "【被测设备A】尚未全部录制成功，请先完成或续录设备 A，再录制对比设备 B"
+            )
+
         self.log("=" * 60)
         self.log("📱 第二步：录制【对比设备B】")
         self.log("=" * 60)
-        
+
         ensure_output_dirs()
-        
-        # 1. 扫描音源（应该与A相同）
+
+        if self.device_b_has_partial:
+            n_ok = sum(1 for r in self._device_b_results if r.get("ok"))
+            self.log(
+                f"🔁 续录模式：已有 {n_ok}/{len(self._device_b_results)} 条成功，"
+                "将跳过已成功音源并从失败处继续"
+            )
+
         tracks = discover_standard_tracks()
         if not tracks:
             return False, f"未发现音源：请将 wav/mp3 等放入 {ASSETS_AUDIO_DIR}"
-        
+
         self.log(f"📋 发现 {len(tracks)} 个音源文件")
-        
-        # 2. 连接设备
+
         try:
             device = adbutils.adb.device(device_serial)
             self.log(f"✅ 已连接设备: {device_serial}")
         except Exception as exc:
             return False, f"连接设备失败: {exc}"
-        
-        # 3. 推送音源到设备
-        self.log("📤 推送音源到设备...")
-        plan = []
-        for i, (group, rel) in enumerate(tracks, start=1):
-            ext = Path(rel).suffix.lower()
-            remote_base = f"track_{i:03d}{ext}"
-            plan.append((group, rel, remote_base))
-        
-        for group, rel, remote_base in plan:
-            src = ASSETS_AUDIO_DIR / rel
-            ok_push, msg_push = self._push_one_track_with_logs(
-                device=device,
-                src=src,
-                remote_base=remote_base,
-                group=group,
-                rel=rel,
-            )
-            if not ok_push:
-                return False, msg_push
-        
-        # 4. 按节目循环：播放 + PC录音
-        self.log("🎵 开始按节目录制...")
-        results = []
-        
-        for idx, (group, rel, remote_base) in enumerate(plan, start=1):
-            stem_safe = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in rel)[:50]
-            out_name = f"{self._safe_tag}_B_{idx:02d}_{group}_{stem_safe}.wav"
-            out_path = RECORDED_DIR / out_name
-            
-            self.log(f"\n[音源 {idx}/{len(plan)}] {group} / {rel}")
-            
-            ok, msg = self._record_one_track(
-                device,
-                remote_base,
-                out_path,
-                duration,
-                source_path=ASSETS_AUDIO_DIR / rel,
-            )
-            
-            result = {
-                "track_index": idx,
-                "group": group,
-                "filename": rel,
-                "local_wav": str(out_path),
-                "ok": ok,
-                "message": msg,
-                "device": "B",
-                "device_serial": device_serial,
-            }
-            results.append(result)
-            
-            if ok:
-                self.log(f"  ✅ 录制成功: {out_name}")
-            else:
-                self.log(f"  ❌ 录制失败: {msg}")
-                return False, f"音源 {idx} 录制失败: {msg}"
-            
-            # 音源之间稍作停顿
-            if idx < len(plan):
-                time.sleep(0.2)
-        
-        self._device_b_results = results
-        self.log("\n✅ 【对比设备B】所有音源录制完成！")
-        
-        # 5. 更新播放清单
-        self._save_playlist()
-        
-        return True, "ok"
+
+        plan = self._build_track_plan(tracks)
+        return self._record_tracks_for_device(
+            side="B",
+            device=device,
+            device_serial=device_serial,
+            plan=plan,
+            duration=duration,
+            existing_results=list(self._device_b_results),
+        )
     
     def _save_playlist(self):
         """保存播放清单"""
@@ -704,6 +748,32 @@ class DualDeviceFullRecorder:
         self._device_a_results.clear()
         self._device_b_results.clear()
         self._playlist_path = None
+
+    def clear_device_a_recordings(self) -> None:
+        """仅清除被测设备 A 的录音与内存结果。"""
+        for result in self._device_a_results:
+            path = result.get("local_wav")
+            if path and Path(path).is_file():
+                try:
+                    Path(path).unlink()
+                    self.log(f"🗑️ 已删除：{path}")
+                except Exception as e:
+                    self.log(f"⚠️ 删除失败 {path}: {e}")
+        self._device_a_results.clear()
+        self._save_playlist()
+
+    def clear_device_b_recordings(self) -> None:
+        """仅清除对比设备 B 的录音与内存结果。"""
+        for result in self._device_b_results:
+            path = result.get("local_wav")
+            if path and Path(path).is_file():
+                try:
+                    Path(path).unlink()
+                    self.log(f"🗑️ 已删除：{path}")
+                except Exception as e:
+                    self.log(f"⚠️ 删除失败 {path}: {e}")
+        self._device_b_results.clear()
+        self._save_playlist()
 
     def clear_recordings(self) -> None:
         """清除已录制的音频文件（用于重新开始）"""

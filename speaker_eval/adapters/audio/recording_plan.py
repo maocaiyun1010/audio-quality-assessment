@@ -20,6 +20,21 @@ def is_full_track_play_enabled() -> bool:
     return v in {"1", "true", "yes", "on"}
 
 
+def full_track_end_pad_seconds() -> float:
+    """
+    整曲模式下在探测时长末尾追加的缓冲（秒），补偿播放器起播/解码延迟，避免尾音被截断。
+
+    可通过 ``SPEAKER_FULL_TRACK_END_PAD_SEC`` 调整（默认 0.35，范围 0～2）。
+    """
+    if not is_full_track_play_enabled():
+        return 0.0
+    raw = (os.getenv("SPEAKER_FULL_TRACK_END_PAD_SEC", "0.35") or "").strip()
+    try:
+        return max(0.0, min(2.0, float(raw)))
+    except ValueError:
+        return 0.35
+
+
 def probe_source_duration_seconds(src: Path) -> float | None:
     """返回音源文件时长（秒）；无法识别时返回 None。"""
     try:
@@ -71,5 +86,13 @@ def effective_play_seconds(
         )
         return configured
     use_sec = max(0.5, float(dur))
-    log(f"🎵 完整音频模式：{source_path.name} 时长 {use_sec:.2f}s（忽略时长滑块）")
+    pad = full_track_end_pad_seconds()
+    if pad > 0:
+        use_sec += pad
+        log(
+            f"🎵 完整音频模式：{source_path.name} 文件 {dur:.2f}s + 尾缓冲 {pad:.2f}s "
+            f"→ 有效段 {use_sec:.2f}s（忽略时长滑块）"
+        )
+    else:
+        log(f"🎵 完整音频模式：{source_path.name} 时长 {use_sec:.2f}s（忽略时长滑块）")
     return use_sec

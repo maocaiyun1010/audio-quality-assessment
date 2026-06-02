@@ -2028,7 +2028,10 @@ with st.sidebar:
         "播放完整音频（不受时长设置影响）",
         value=bool(st.session_state.get("play_full_track_enabled", False)),
         key="play_full_track_enabled",
-        help="开启后每条音频按真实时长播放与录制，忽略“时长(秒)”滑块。",
+        help=(
+            "开启后每条按 soundfile 探测的文件时长播放与录制（MP3/WAV 均可），忽略“时长(秒)”滑块；"
+            "末尾默认追加 0.35s 缓冲以防尾音被截断（环境变量 SPEAKER_FULL_TRACK_END_PAD_SEC）。"
+        ),
     )
     duration = st.slider("时长(秒)", 10, 60, int(config.DURATION), disabled=play_full_track)
 
@@ -2519,7 +2522,9 @@ if eval_mode == "dual_device":
         '📋 <strong>录制流程说明：</strong><br>'
         '1️⃣ 扫描音源 → 推送至被测设备A → 按节目循环（播放+录音）<br>'
         '2️⃣ 保持麦克风不动 → 推送至对比设备B → 按节目循环（播放+录音）<br>'
-        '3️⃣ 两段都完成后 → 按节目配对送Dify评分 → 生成报告'
+        '3️⃣ 两段都完成后 → 按节目配对送Dify评分 → 生成报告<br>'
+        '💡 若中途某条失败，再次点击同一步按钮可<strong>续录</strong>（跳过已成功音源）；'
+        '需全部重来请点「清除重录」。'
         '</p>'
         '</div>',
         unsafe_allow_html=True,
@@ -2773,25 +2778,44 @@ if eval_mode == "dual_device":
         
         with step1_col:
             can_record_a = bool(device_a_serial.strip()) and _has_selected_tracks
-            _has_old_dual_data = bool(recorder.device_a_results or recorder.device_b_results)
+            _partial_a = getattr(recorder, "device_a_has_partial", False) or (
+                bool(recorder.device_a_results) and not recorder.is_device_a_complete
+            )
+            _complete_a = recorder.is_device_a_complete
+            if _partial_a:
+                _btn_a_label = "▶ 续录【被测设备A】（从失败处继续）"
+                _btn_a_help = (
+                    "从上次失败的音源继续，已成功条目不会重录。"
+                    "若需全部重录请使用右侧「清除重录」。"
+                )
+            elif _complete_a:
+                _btn_a_label = "🔁 重新录制【被测设备A】"
+                _btn_a_help = "将清除设备 A 的录音；若已有设备 B 录音也会一并清除后重录。"
+            else:
+                _btn_a_label = "📹 第一步：录制【被测设备A】"
+                _btn_a_help = "需要先填写被测设备A序列号并至少勾选 1 个音源"
             if st.button(
-                "📹 第一步：录制【被测设备A】" if not _has_old_dual_data else "🔁 第一步：重新录制【被测设备A】",
-                type="primary" if not recorder.is_device_a_complete else "secondary",
+                _btn_a_label,
+                type="primary" if not _complete_a else "secondary",
                 width="stretch",
                 disabled=not can_record_a,
-                help=(
-                    "需要先填写被测设备A序列号并至少勾选 1 个音源"
-                    if not _has_old_dual_data
-                    else "检测到已有录制结果，将先清空历史数据并从第一步重新录制"
-                ),
+                help=_btn_a_help,
             ):
                 try:
                     st.info(f"▶ 开始录制【被测设备A】 (设备: {device_a_serial})...")
                     _append_run_log("info", f"开始录制【被测设备A】({device_a_serial.strip()})")
-                    if _has_old_dual_data:
-                        recorder.clear_recordings()
-                        st.info("🧹 检测到历史双设备录制结果，已自动清理并从第一步重录。")
-                        _append_run_log("warning", "已清理历史双设备录制结果，执行第一步重录")
+                    if _complete_a:
+                        recorder.clear_device_a_recordings()
+                        if recorder.device_b_results:
+                            recorder.clear_device_b_recordings()
+                        st.info("🧹 已清除 A/B 历史录音，将从第一步重新录制。")
+                        _append_run_log("warning", "用户选择重新录制设备 A，已清除 A/B 历史录音")
+                    elif _partial_a:
+                        _append_run_log(
+                            "info",
+                            "续录【被测设备A】",
+                            "跳过已成功音源，从失败处继续",
+                        )
                     # 应用麦克风配置
                     _patch_input_device(_mic_spec)
                     _patch_omnimic_gain(float(gain))
@@ -2815,16 +2839,38 @@ if eval_mode == "dual_device":
         
         with step2_col:
             can_record_b = recorder.is_device_a_complete and bool(device_b_serial.strip()) and _has_selected_tracks
+            _partial_b = getattr(recorder, "device_b_has_partial", False) or (
+                bool(recorder.device_b_results) and not recorder.is_device_b_complete
+            )
+            _complete_b = recorder.is_device_b_complete
+            if _partial_b:
+                _btn_b_label = "▶ 续录【对比设备B】（从失败处继续）"
+                _btn_b_help = "从上次失败的音源继续；已成功条目不会重录。"
+            elif _complete_b:
+                _btn_b_label = "🔁 重新录制【对比设备B】"
+                _btn_b_help = "仅清除设备 B 的录音后重录；设备 A 录音保留。"
+            else:
+                _btn_b_label = "📹 第二步：录制【对比设备B】"
+                _btn_b_help = "必须先完成A录制、填写对比设备B序列号，并至少勾选 1 个音源"
             if st.button(
-                "📹 第二步：录制【对比设备B】",
-                type="primary" if (recorder.is_device_a_complete and not recorder.is_device_b_complete) else "secondary",
+                _btn_b_label,
+                type="primary" if (recorder.is_device_a_complete and not _complete_b) else "secondary",
                 width="stretch",
                 disabled=not can_record_b,
-                help="必须先完成A录制、填写对比设备B序列号，并至少勾选 1 个音源",
+                help=_btn_b_help,
             ):
                 try:
                     st.info(f"▶ 开始录制【对比设备B】 (设备: {device_b_serial})...")
                     _append_run_log("info", f"开始录制【对比设备B】({device_b_serial.strip()})")
+                    if _complete_b and hasattr(recorder, "clear_device_b_recordings"):
+                        recorder.clear_device_b_recordings()
+                        _append_run_log("warning", "用户选择重新录制设备 B，已清除 B 历史录音")
+                    elif _partial_b:
+                        _append_run_log(
+                            "info",
+                            "续录【对比设备B】",
+                            "跳过已成功音源，从失败处继续",
+                        )
                     # 应用麦克风配置
                     _patch_input_device(_mic_spec)
                     _patch_omnimic_gain(float(gain))
